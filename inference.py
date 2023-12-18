@@ -1,4 +1,6 @@
 from transformer import *    
+from torchinfo import summary
+from tqdm import tqdm
 
 m = Transformer(
     vocab_size=len(sp),

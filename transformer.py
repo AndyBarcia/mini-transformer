@@ -1,14 +1,9 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from einops import einsum, rearrange
-import random
-import sys
-from tqdm import tqdm
-from torchinfo import summary
 
 from tokenizer import *
-from rotary_embeddings import *
+from attention import *
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 batch_size = 96
@@ -16,119 +11,6 @@ block_size = 256
 
 # 256 tokenizer.
 encode, decode, sp = create_tokenizer("unigram_256_simplified.model")
-
-# Efficient attention with a window of a given size.
-# Implements both relative and rotary embeddings.
-class WindowAttention(nn.Module):
-    def __init__(
-        self,
-        n_embed,
-        window_size,
-        n_head,
-        window_stride=1,
-        head_size=None,
-        encoding="relative",
-        dropout=0.4
-    ):
-        super().__init__()
-        self.head_size = n_embed // n_head if head_size is None else head_size
-        self.n_head = n_head
-        self.head_surface = self.n_head*self.head_size
-        self.window_size = window_size
-        self.window_stride = window_stride
-        self.n_embed = n_embed
-                
-        self.encoding = encoding
-        if encoding=="relative":
-            self.queries_pos = nn.Parameter(torch.empty(self.window_size, self.n_head, self.head_size))
-            nn.init.xavier_normal_(self.queries_pos)
-
-            self.values_pos = nn.Parameter(torch.empty(self.window_size, self.n_head, self.head_size))
-            nn.init.xavier_normal_(self.values_pos)
-        elif encoding == "rotary":
-            self.rotary_emb = RotaryEmbedding(self.head_size,257)
-                    
-        self.kqv = nn.Linear(n_embed, self.head_size*n_head*3, bias=False)
-        
-        self.out_head = nn.Linear(self.head_size*n_head, n_embed)
-        
-        # Triangular matrix to mask padding tokens.
-        # Convertir esto a matriz (L,L,H). De esta manera también es fácil
-        # limitar el tamaño de varios heads, a ver qué pasa.
-        self.register_buffer('tril', torch.tril(torch.ones(self.window_size, self.window_size)).flip((1,)), persistent=False)
-        
-        # Dropout
-        self.dropout = nn.Dropout(dropout)
-    
-    def forward(self, x):
-        B,T,C = x.shape
-        
-        # If the aren't enough tokens, no token can attend to anything, so we just skip.
-        if T <= self.window_stride:
-            return torch.zeros_like(x), None
-        
-        #print(f"B {B}; H {self.n_head}; T {T}; L {self.window_size}; S {self.window_stride}; C {self.head_size}")
-        
-        x = self.kqv(x).view(B,T,3,self.n_head,-1) # (B,T,(3*H*C))
-        
-        if self.encoding == "rotary":
-            x[:,:,0:2] = self.rotary_emb(x[:,:,0:2], seq_dim=-3)
-
-        x = x.view(B,T,-1)
-        
-        # Add padding tokens (necessary for leftmost tokens).
-        pad = self.window_size*self.window_stride
-        x = F.pad(x, (0,0,pad,0), "constant", 0) # (B,T+pad,(3*H*C))
-        
-        # Unfold windows
-        size = (B,T,self.window_size,3,self.n_head,self.head_size)
-        stride = (
-            (T+pad)*3*self.head_surface, # B
-            3*self.head_surface, # T
-            3*self.head_surface*self.window_stride, # L
-            self.head_surface, # 3
-            self.head_size, # H
-            1 # C
-        )
-        x = x.as_strided(size, stride)[:,self.window_stride:] # (B,T,L,3*H*C)
-        
-        # Extract Keys, Queries and Values of each individual head.
-        tk, tq, tv = x[:,:,:,0], x[:,:,:,1], x[:,:,:,2] # (B,T,L,H,C)
-        
-        # Get a TxL matrix, with the attention scores of each token for their window.
-        wei = (tk*tq).sum(-1) # "b head key query c, b head key query c -> b head key query" (B,T,L,H)
-        
-        # Effect of position: "head query c, b head key query c -> b head key query"
-        if self.encoding == "relative":
-            pos = self.queries_pos # (L,H,C)
-            wei += (pos*tq).sum(-1) # (B,T,L,H)
-                        
-        # Scale, and apply softmax.
-        wei = wei * self.head_size**-0.5 # (B,T,L,H)
-        # Ignore padding tokens.        
-        tril = self.tril[:(T-self.window_stride)].unsqueeze(-1).expand(-1,-1,self.n_head)
-        wei[:,:self.window_size] = wei[:,:self.window_size].masked_fill(tril == 0, float('-inf'))        
-        # Limit attention to sum up to one.
-        wei = F.softmax(wei, dim=-2) # (B,T,L,H)
-        
-        # Bloquear aleatoriamente algunas comunicaciones entre tokens.
-        wei = self.dropout(wei) # (B,T,L,H)
-        
-        # Valores de salida de los valores de los tokens.
-        out = (wei.unsqueeze(-1) * tv).sum(-3) # (B,T,H,C)
-        
-        # Valores de salida en base a las posiciones relativas de los tokens.
-        if self.encoding == "relative":
-            pos = self.values_pos # (L,H,C)
-            out += (wei.unsqueeze(-1) * pos).sum(-3) # (B,T,H,C)
-                
-        # Juntar las distintas cabezas de cada token otra vez.
-        out = out.view(B,T-self.window_stride, -1) # (B,T,H*C)
-        
-        # Recoperar primeros tokens que no atienden a nada.
-        out = F.pad(out, (0,0,self.window_stride,0), "constant", 0)
-                
-        return self.out_head(out), wei
 
 # Una simple capa oculta de una red neuronal, con 
 # una función de activación ReLU.

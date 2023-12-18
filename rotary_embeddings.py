@@ -8,7 +8,7 @@ import random
 # https://github.com/lucidrains/PaLM-rlhf-pytorch/blob/main/palm_rlhf_pytorch/palm.py#L69
 # https://arxiv.org/pdf/2104.09864.pdf
 class RotaryEmbedding(nn.Module):
-    def __init__(self, dim, seq_len, scale_base=512):
+    def __init__(self, dim, seq_len, scale_base=512, device='cuda' if torch.cuda.is_available() else 'cpu'):
         super().__init__()
         assert dim % 2 == 0
         

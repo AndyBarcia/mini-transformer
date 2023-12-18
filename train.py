@@ -1,5 +1,4 @@
 from transformer import *
-from datetime import datetime
 import matplotlib.pyplot as plt
 import itertools
 import pandas as pd
