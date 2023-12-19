@@ -12,28 +12,29 @@ block_size = 256
 # 256 tokenizer.
 encode, decode, sp = create_tokenizer("unigram_256_simplified.model")
 
-# Una simple capa oculta de una red neuronal, con 
-# una función de activación ReLU.
-# La capa tiene 4 veces más neuronas que la entrada
-# y salida.
+"""
+Standard Feed Forward layer with ReLU activation
+and 4 times as many hidden neurons as input neurons. 
+"""
 class FeedForward(nn.Module):
     def __init__(self, n_embed, dropout=0.4):
         super().__init__()
         self.net = nn.Sequential(
-            # Aplicar transformación lineal.
             nn.Linear(n_embed, 4*n_embed),
-            # Aplicar función de activación.
             nn.ReLU(),
-            # Devolver a camino residual.
             nn.Linear(4*n_embed, n_embed),
-            # Bloquear (dropout) ciertas neuronas.
-            # Previente overfitting
             nn.Dropout(dropout)
         )
     
     def forward(self, x):
         return self.net(x)
 
+"""
+Standard decoder-only Transformer block implementing window attention
+and either relative or rotary positioning.
+
+The Feed Forward layer is optional.
+"""
 class TransformerBlock(nn.Module):
     def __init__(
         self, 
@@ -60,7 +61,12 @@ class TransformerBlock(nn.Module):
         
         return x, wei
 
+"""
+Standard decoder-only Transformer  implementing window attention
+and either relative or rotary positioning.
 
+Each of the layers of the transformer is independently configurable.
+"""
 class Transformer(nn.Module):
     def __init__(
         self, 
@@ -76,7 +82,7 @@ class Transformer(nn.Module):
         self.n_embed = n_embed
         self.dropout = dropout
         
-        # Propiedades que se pasarán a cada una de las capas.
+        # Setup configuration of each layer.
         self.n_layers = n_layers
         for layer_prop in layers:
             if isinstance(layers[layer_prop],tuple):
@@ -133,11 +139,7 @@ class Transformer(nn.Module):
         
         # Append start token.
         x = torch.cat([self.start_token[None, None, :].repeat(B,1,1), token_embed], dim=1)
-        
-        # Rotate embeddings
-        #if self.encoding == "rotary":
-        #    x = self.rotary_emb.rotate_queries_or_keys(x)
-        
+                
         # Pass embeddings thrhogh all layer blocks.
         if save_layer_activations:
             layers = x.unsqueeze(1) # (B,L,T,C)
@@ -153,35 +155,25 @@ class Transformer(nn.Module):
                 if save_attention:
                     attentions.append(wei)
         x = self.ln(x) # (B,T,C)
-                
+
+        # Turn embeddings of the last layer into logits
+        logits = self.lm_head(x) # (B,T,vocab_size)             
+        results = {
+            "logits": logits,
+            "layer_activations": layers,
+            "attentions": attentions,
+            "output_embeddings": x,
+        }        
+        
+        # Calculate loss if target output is given.
+        # Otherwise, just return the logits.
         if targets is None: 
-            logits = self.lm_head(x) # (B,T,vocab_size)
-                        
-            results = {
-                "logits": logits,
-                "layer_activations": layers,
-                "attentions": attentions,
-                "output_embeddings": x,
-            }
-            
             return results, None
-        else:
-            logits = self.lm_head(x) # (B,T,vocab_size)
-                        
-            results = {
-                "logits": logits,
-                "layer_activations": layers,
-                "attentions": attentions,
-                "output_embeddings": x,
-            }
-            
+        else:            
             logits = logits[:,:,:].view(-1,self.vocab_size)
             targets = targets.flatten()
             mean_loss = F.cross_entropy(logits, targets, reduction="mean")
-            losses = {
-                "mean": mean_loss,
-            }
-            
+            losses = { "mean": mean_loss }
             return results, losses
     
     @torch.no_grad()
@@ -190,11 +182,6 @@ class Transformer(nn.Module):
         self.eval()
         with torch.inference_mode():
             for name, split in data_splits.items():
-            #for name, split in [("train", data_train), ("test", data_test)]:
-            #    # TEST
-            #    split = get_batch(name)
-            #    # TEST
-                
                 losses = torch.zeros(test_iters, device=device)
 
                 split = iter(split)
@@ -219,21 +206,13 @@ class Transformer(nn.Module):
         self.eval()
         with torch.inference_mode():
             for i in range(max_new_tokens):
-                # TODO: calcular cuál es la cantidad de tokens que podemos
-                # utilizar que tenga sentido (el límite de propagación de información).
                 idx_cond = idx[:, -block_size:]
-                # Obtener predicciones
                 results, loss = self(idx_cond)
                 
                 logits = results["logits"][:,-1] # (B,vocab_size)
                 logits[:, idx[:,-32:]] /= repetition_penalty
                                 
-                probs = F.softmax(logits / temperature, dim=-1) # (C)
-                
-                #v,i = torch.sort(probs)
-                #for b in range(probs.shape[0]):
-                #    probs[b][i[b][torch.cumsum(v[b], -1) < 0.1]] = 0.0
-                                
+                probs = F.softmax(logits / temperature, dim=-1) # (C)                                
                 idx = torch.cat([idx, torch.multinomial(probs, num_samples=1)], dim=1)
                 yield idx
         self.train()
